@@ -24,6 +24,12 @@ const (
 	// VirtualOutboundCatchAllTCPFilterChainName is the name of the catch all tcp filter chain
 	VirtualOutboundCatchAllTCPFilterChainName = "virtualOutbound-catchall-tcp"
 
+	// VirtualOutboundHTTPRouteConfigName is the RDS route config name for the virtual outbound listener's HCM.
+	VirtualOutboundHTTPRouteConfigName = "virtualOutbound-http"
+
+	// VirtualOutboundHTTPFilterChainName is the name of the http filter chain on the virtual outbound listener.
+	VirtualOutboundHTTPFilterChainName = "virtualOutbound-http"
+
 	// VirtualOutboundBlackholeFilterChainName is the name of the filter chain to blackhole undesired traffic
 	VirtualOutboundBlackholeFilterChainName = "virtualOutbound-blackhole"
 	// VirtualInboundBlackholeFilterChainName is the name of the filter chain to blackhole undesired traffic

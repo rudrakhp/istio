@@ -322,6 +322,27 @@ func (configgen *ConfigGeneratorImpl) buildOutboundClusters(cb *ClusterBuilder, 
 	resources := make([]*discovery.Resource, 0)
 	efKeys := cp.efw.KeysApplyingTo(networking.EnvoyFilter_CLUSTER)
 	hit, miss := 0, 0
+
+	// When EnableAllowAnyHTTPDFPRoute is on, create the outbound|15001||* DFP cluster for the virtual outbound allow-any "*" vhost.
+	if proxy.Type == model.SidecarProxy && features.EnableAllowAnyHTTPDFPRoute && cb.req.Push != nil {
+		virtualPort := int(cb.req.Push.Mesh.ProxyListenPort)
+		allowAnyPort := &model.Port{Port: virtualPort, Protocol: protocol.HTTP, Name: "http"}
+		allowAnyService := &model.Service{
+			Hostname:   host.Name("*"),
+			Resolution: model.DynamicDNS,
+			Ports:      []*model.Port{allowAnyPort},
+		}
+		clusterName := model.BuildSubsetKey(model.TrafficDirectionOutbound, "", allowAnyService.Hostname, virtualPort)
+		dfpCluster := cb.buildDFPCluster(clusterName, allowAnyService, allowAnyPort)
+		// No DestinationRule is applied for "*" — it is not in the sidecar scope, so sc.destinationRules["*"] is never populated.
+		if destRule := proxy.SidecarScope.DestinationRule(model.TrafficDirectionOutbound, proxy, allowAnyService.Hostname); destRule != nil {
+			cb.applyDestinationRule(dfpCluster, DefaultClusterMode, allowAnyService, allowAnyPort, nil, destRule.GetRule(), nil)
+		}
+		if patched := cp.patch([]host.Name{allowAnyService.Hostname}, dfpCluster.build()); patched != nil {
+			resources = append(resources, patched)
+		}
+	}
+
 	for _, service := range services {
 		if service.Resolution == model.Alias {
 			continue

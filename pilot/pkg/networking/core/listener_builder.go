@@ -42,6 +42,7 @@ import (
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pilot/pkg/xds/requestidextension"
+	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/proto"
@@ -133,6 +134,13 @@ func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
 
 	filterChains := buildOutboundCatchAllNetworkFilterChains(lb.node, lb.push)
 
+	needHTTPInspector := false
+	if httpChain := lb.buildVirtualOutboundHTTPFilterChain(); httpChain != nil {
+		needHTTPInspector = true
+		// Insert HTTP chain before the catch-all TCP chain: [blackhole, http, catchall-tcp]
+		filterChains = append(append(filterChains[:1:1], httpChain), filterChains[1:]...)
+	}
+
 	actualWildcards, _ := getWildcardsAndLocalHost(lb.node.GetIPMode())
 	// add an extra listener that binds to the port that is the recipient of the iptables redirect
 	ipTablesListener := &listener.Listener{
@@ -153,10 +161,60 @@ func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
 		ipTablesListener.AdditionalAddresses = util.BuildAdditionalAddresses(ipv4Wildcards[0:], uint32(lb.push.Mesh.ProxyListenPort))
 	}
 
+	// HTTP inspector is required when we have an HCM chain so Envoy can detect HTTP and match the chain
+	if needHTTPInspector {
+		ipTablesListener.ListenerFilters = append(ipTablesListener.ListenerFilters, xdsfilters.HTTPInspector)
+	}
+
 	class := model.OutboundListenerClass(lb.node.Type)
 	accessLogBuilder.setListenerAccessLog(lb.push, lb.node, ipTablesListener, class)
 	lb.virtualOutboundListener = ipTablesListener
 	return lb
+}
+
+// buildVirtualOutboundHTTPFilterChain builds the HTTP filter chain for the virtual outbound listener.
+// Only built when EnableAllowAnyHTTPDFPRoute is on; adds a DFP filter for "*" (allow-any).
+func (lb *ListenerBuilder) buildVirtualOutboundHTTPFilterChain() *listener.FilterChain {
+	if !features.EnableAllowAnyHTTPDFPRoute {
+		return nil
+	}
+	ph := util.GetProxyHeaders(lb.node, lb.push, istionetworking.ListenerClassSidecarOutbound)
+	httpOpts := &httpListenerOpts{
+		rds:        model.VirtualOutboundHTTPRouteConfigName,
+		statPrefix: "outbound_virtualOutbound",
+		connectionManager: &hcm.HttpConnectionManager{
+			ServerName:                 ph.ServerName,
+			ServerHeaderTransformation: ph.ServerHeaderTransformation,
+			GenerateRequestId:          ph.GenerateRequestID,
+		},
+		suppressEnvoyDebugHeaders: ph.SuppressDebugHeaders,
+		skipIstioMXHeaders:        ph.SkipIstioMXHeaders,
+		protocol:                  protocol.HTTP,
+		class:                     istionetworking.ListenerClassSidecarOutbound,
+		useRemoteAddress:          features.UseRemoteAddress,
+		port:                      0,
+	}
+	if features.HTTP10 || enableHTTP10(lb.node.Metadata.HTTP10) {
+		httpOpts.connectionManager.HttpProtocolOptions = &core.Http1ProtocolOptions{
+			AcceptHttp_10: true,
+		}
+	}
+	connectionManager := lb.buildHTTPConnectionManager(httpOpts)
+	filters := connectionManager.HttpFilters
+	// Order: [filters before router] + [DFP filters] + [router (must be last)]; matches per-port outbound.
+	dfpFilter := xdsfilters.BuildSidecarOutboundDynamicForwardProxyFilter(model.BuildDNSCacheName(host.Name("*")))
+	connectionManager.HttpFilters = append(append(filters[:len(filters)-1], dfpFilter), filters[len(filters)-1])
+	hcmFilter := &listener.Filter{
+		Name:       wellknown.HTTPConnectionManager,
+		ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(connectionManager)},
+	}
+	return &listener.FilterChain{
+		Name: model.VirtualOutboundHTTPFilterChainName,
+		FilterChainMatch: &listener.FilterChainMatch{
+			ApplicationProtocols: plaintextHTTPALPNs,
+		},
+		Filters: []*listener.Filter{hcmFilter},
+	}
 }
 
 func (lb *ListenerBuilder) patchOneListener(l *listener.Listener, ctx networking.EnvoyFilter_PatchContext) *listener.Listener {

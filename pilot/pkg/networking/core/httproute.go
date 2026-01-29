@@ -141,6 +141,18 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(
 	efw *model.MergedEnvoyFilterWrapper,
 	efKeys []string,
 ) (*discovery.Resource, bool) {
+	// Virtual outbound HCM (15001) route config
+	if routeName == model.VirtualOutboundHTTPRouteConfigName {
+		rc := buildVirtualOutboundHTTPRouteConfig(node, req.Push, efw)
+		if rc == nil {
+			return nil, false
+		}
+		return &discovery.Resource{
+			Name:     rc.Name,
+			Resource: protoconv.MessageToAny(rc),
+		}, false
+	}
+
 	listenerPort, useSniffing, err := extractListenerPort(routeName)
 	if err != nil && routeName != model.RDSHttpProxy && !strings.HasPrefix(routeName, model.UnixAddressPrefix) {
 		// TODO: This is potentially one place where envoyFilter ADD operation can be helpful if the
@@ -186,7 +198,7 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(
 
 	if !useSniffing {
 		ph := util.GetProxyHeaders(node, req.Push, istionetworking.ListenerClassSidecarOutbound)
-		virtualHosts = append(virtualHosts, buildCatchAllVirtualHost(node, ph.IncludeRequestAttemptCount, ph.XForwardedHost))
+		virtualHosts = append(virtualHosts, buildCatchAllVirtualHost(node, req.Push, ph.IncludeRequestAttemptCount, ph.XForwardedHost))
 	}
 
 	out := &route.RouteConfiguration{
@@ -210,6 +222,28 @@ func (configgen *ConfigGeneratorImpl) buildSidecarOutboundHTTPRouteConfig(
 	}
 
 	return resource, false
+}
+
+// buildVirtualOutboundHTTPRouteConfig builds the RDS route config for the virtual outbound listener's HCM.
+// This RDS is only requested when the virtual outbound HCM exists (EnableAllowAnyHTTPDFPRoute on).
+// The config has a single "*" vhost from buildCatchAllVirtualHost (DFP cluster when flag is on).
+func buildVirtualOutboundHTTPRouteConfig(node *model.Proxy, push *model.PushContext, efw *model.MergedEnvoyFilterWrapper) *route.RouteConfiguration {
+	if node.Type != model.SidecarProxy || node.SidecarScope == nil || push == nil {
+		return nil
+	}
+	ph := util.GetProxyHeaders(node, push, istionetworking.ListenerClassSidecarOutbound)
+	virtualHosts := []*route.VirtualHost{
+		buildCatchAllVirtualHost(node, push, ph.IncludeRequestAttemptCount, ph.XForwardedHost),
+	}
+	out := &route.RouteConfiguration{
+		Name:                           model.VirtualOutboundHTTPRouteConfigName,
+		VirtualHosts:                   virtualHosts,
+		ValidateClusters:               proto.BoolFalse,
+		MaxDirectResponseBodySizeBytes: istio_route.DefaultMaxDirectResponseBodySizeBytes,
+		IgnorePortInHostMatching:       true,
+	}
+	out = envoyfilter.ApplyRouteConfigurationPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, node, efw, out)
+	return out
 }
 
 func extractListenerPort(routeName string) (int, bool, error) {
@@ -775,7 +809,35 @@ func getUniqueAndSharedDNSDomain(fqdnHostname, proxyDomain string) (partsUnique 
 	return partsUnique, partsShared
 }
 
-func buildCatchAllVirtualHost(node *model.Proxy, includeRequestAttemptCount bool, appendXForwardedHost bool) *route.VirtualHost {
+func buildCatchAllVirtualHost(node *model.Proxy, push *model.PushContext, includeRequestAttemptCount bool, appendXForwardedHost bool) *route.VirtualHost {
+	// When EnableAllowAnyHTTPDFPRoute is on, replace the "*" vhost with one that routes to the virtual outbound DFP cluster.
+	if push != nil && features.EnableAllowAnyHTTPDFPRoute && node.Type == model.SidecarProxy {
+		virtualOutboundPort := int(push.Mesh.ProxyListenPort)
+		clusterName := model.BuildSubsetKey(model.TrafficDirectionOutbound, "", host.Name("*"), virtualOutboundPort)
+		notimeout := durationpb.New(0)
+		return &route.VirtualHost{
+			Name:    util.Passthrough,
+			Domains: []string{"*"},
+			Routes: []*route.Route{
+				{
+					Name: util.Passthrough,
+					Match: &route.RouteMatch{
+						PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"},
+					},
+					Action: &route.Route_Route{
+						Route: &route.RouteAction{
+							ClusterSpecifier: &route.RouteAction_Cluster{Cluster: clusterName},
+							Timeout:          notimeout,
+							// nolint: staticcheck
+							MaxGrpcTimeout:       notimeout,
+							AppendXForwardedHost: appendXForwardedHost,
+						},
+					},
+				},
+			},
+			IncludeRequestAttemptCount: includeRequestAttemptCount,
+		}
+	}
 	if util.IsAllowAnyOutbound(node) {
 		egressCluster := util.PassthroughCluster
 		notimeout := durationpb.New(0)

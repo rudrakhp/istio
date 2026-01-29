@@ -206,6 +206,13 @@ var (
 	EnableRouteCollapse = env.Register("PILOT_ENABLE_ROUTE_COLLAPSE_OPTIMIZATION", true,
 		"If true, Pilot will merge virtual hosts with the same routes into a single virtual host, as an optimization.").Get()
 
+	// EnableAllowAnyHTTPDFPRoute behaves as if a ServiceEntry with Dynamic DNS on the virtual outbound port (15001)
+	// and hostname "*" exists: virtual outbound HCM is built, and the catch-all "*" vhost in all route configs
+	// routes to the virtual outbound DFP cluster instead of passthrough/blackhole.
+	EnableAllowAnyHTTPDFPRoute = env.Register("PILOT_ENABLE_ALLOW_ANY_HTTP_DFP_ROUTE", false,
+		"If enabled, the catch-all '*' virtual host in sidecar outbound HTTP route configs routes to the "+
+			"virtual outbound DFP cluster (allow-any HTTP via DFP on 15001), and the virtual outbound listener gets an HCM.").Get()
+
 	MulticlusterHeadlessEnabled = env.Register("ENABLE_MULTICLUSTER_HEADLESS", true,
 		"If true, the DNS name table for a headless service will resolve to same-network endpoints in any cluster.").Get()
 
