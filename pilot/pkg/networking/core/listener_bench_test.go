@@ -19,11 +19,13 @@ import (
 	"testing"
 
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/test"
 )
 
 // buildHeadlessBenchmarkInstances builds n pod endpoints for a headless/passthrough TCP
@@ -86,27 +88,32 @@ func BenchmarkOutboundListenersHeadlessService(b *testing.B) {
 	const targetHost = "headless.default.svc.cluster.local"
 	const numPods = 1000
 
-	for _, numVirtualServices := range []int{1000, 2000, 4000} {
-		virtualServices := buildHeadlessBenchmarkVirtualServices(targetHost, numVirtualServices)
-		b.Run(fmt.Sprintf("vs=%d/pods=%d", numVirtualServices, numPods), func(b *testing.B) {
-			svc := buildServiceWithPort(targetHost, 9999, protocol.TCP, tnow)
-			svc.Resolution = model.Passthrough
-			svc.Attributes.ServiceRegistry = provider.Kubernetes
+	for _, cidrListener := range []bool{false, true} {
+		b.Run(fmt.Sprintf("cidr=%t", cidrListener), func(b *testing.B) {
+			test.SetForTest(b, &features.EnableHeadlessFilterChainListener, cidrListener)
+			for _, numVirtualServices := range []int{1000, 2000, 4000} {
+				virtualServices := buildHeadlessBenchmarkVirtualServices(targetHost, numVirtualServices)
+				b.Run(fmt.Sprintf("vs=%d/pods=%d", numVirtualServices, numPods), func(b *testing.B) {
+					svc := buildServiceWithPort(targetHost, 9999, protocol.TCP, tnow)
+					svc.Resolution = model.Passthrough
+					svc.Attributes.ServiceRegistry = provider.Kubernetes
 
-			instances := buildHeadlessBenchmarkInstances(svc, numPods)
+					instances := buildHeadlessBenchmarkInstances(svc, numPods)
 
-			cg := NewConfigGenTest(b, TestOptions{
-				Services:  []*model.Service{svc},
-				Instances: instances,
-				Configs:   virtualServices,
-			})
-			proxy := cg.SetupProxy(nil)
-			push := cg.env.PushContext()
+					cg := NewConfigGenTest(b, TestOptions{
+						Services:  []*model.Service{svc},
+						Instances: instances,
+						Configs:   virtualServices,
+					})
+					proxy := cg.SetupProxy(nil)
+					push := cg.env.PushContext()
 
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				NewListenerBuilder(proxy, push).buildSidecarOutboundListeners(proxy, push)
+					b.ResetTimer()
+					b.ReportAllocs()
+					for i := 0; i < b.N; i++ {
+						NewListenerBuilder(proxy, push).buildSidecarOutboundListeners(proxy, push)
+					}
+				})
 			}
 		})
 	}

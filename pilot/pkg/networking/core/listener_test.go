@@ -1069,6 +1069,9 @@ func TestOutboundListenerForHeadlessServices(t *testing.T) {
 	svc.Resolution = model.Passthrough
 	svc.Attributes.ServiceRegistry = provider.Kubernetes
 	services := []*model.Service{svc}
+	overlappingSvc := buildServiceWithPort("overlap.test.com", 9999, protocol.TCP, tnow)
+	overlappingSvc.Resolution = model.Passthrough
+	overlappingSvc.Attributes.ServiceRegistry = provider.Kubernetes
 
 	autoSvc := buildServiceWithPort("test.com", 9999, protocol.Unsupported, tnow)
 	autoSvc.Resolution = model.Passthrough
@@ -1088,9 +1091,10 @@ func TestOutboundListenerForHeadlessServices(t *testing.T) {
 		instances                 []*model.ServiceInstance
 		services                  []*model.Service
 		numListenersOnServicePort int
-		// numFilterChainsOnListener is the expected number of non-default filter chains on the
-		// single wildcard listener that now replaces per-pod listeners. Only checked when > 0.
+		// numFilterChainsOnListener and numCIDRsOnListener describe the non-default chains on the
+		// single wildcard listener that replaces per-pod listeners. Only checked when > 0.
 		numFilterChainsOnListener int
+		numCIDRsOnListener        int
 	}{
 		{
 			name: "gen a listener per IP instance",
@@ -1102,9 +1106,23 @@ func TestOutboundListenerForHeadlessServices(t *testing.T) {
 				buildServiceInstance(services[0], "12.11.11.11"),
 			},
 			services: []*model.Service{svc},
-			// 3 non-self pods → 1 wildcard listener with 3 per-pod CIDR filter chains
+			// 3 non-self pods → 1 wildcard listener with 1 filter chain containing 3 CIDRs.
+			numListenersOnServicePort: 1,
+			numFilterChainsOnListener: 1,
+			numCIDRsOnListener:        3,
+		},
+		{
+			name: "preserve conflicts for overlapping endpoints across services",
+			instances: []*model.ServiceInstance{
+				buildServiceInstance(svc, "10.10.10.10"),
+				buildServiceInstance(svc, "11.11.11.11"),
+				buildServiceInstance(overlappingSvc, "11.11.11.11"),
+				buildServiceInstance(overlappingSvc, "12.11.11.11"),
+			},
+			services:                  []*model.Service{svc, overlappingSvc},
 			numListenersOnServicePort: 1,
 			numFilterChainsOnListener: 3,
+			numCIDRsOnListener:        3,
 		},
 		{
 			name:                      "no listeners for empty services",
@@ -1139,9 +1157,10 @@ func TestOutboundListenerForHeadlessServices(t *testing.T) {
 				buildServiceInstance(extSvcSelector, "11.11.11.11"),
 			},
 			services: []*model.Service{extSvcSelector},
-			// 2 pods → 1 wildcard listener with 2 per-pod CIDR filter chains
+			// 2 pods → 1 wildcard listener with 1 filter chain containing 2 CIDRs.
 			numListenersOnServicePort: 1,
-			numFilterChainsOnListener: 2,
+			numFilterChainsOnListener: 1,
+			numCIDRsOnListener:        2,
 		},
 		{
 			name:                      "no listeners for empty Kubernetes auto protocol",
@@ -1176,10 +1195,14 @@ func TestOutboundListenerForHeadlessServices(t *testing.T) {
 			listeners := NewListenerBuilder(proxy, cg.env.PushContext()).buildSidecarOutboundListeners(proxy, cg.env.PushContext())
 			var listenersToCheck []string
 			var filterChainCount int
+			var cidrCount int
 			for _, l := range listeners {
 				if l.Address.GetSocketAddress().GetPortValue() == 9999 {
 					listenersToCheck = append(listenersToCheck, l.Name)
 					filterChainCount = len(l.FilterChains)
+					for _, fc := range l.FilterChains {
+						cidrCount += len(fc.GetFilterChainMatch().GetPrefixRanges())
+					}
 				}
 
 				if l.ConnectionBalanceConfig == nil || l.ConnectionBalanceConfig.GetExactBalance() == nil {
@@ -1194,7 +1217,178 @@ func TestOutboundListenerForHeadlessServices(t *testing.T) {
 				if filterChainCount != tt.numFilterChainsOnListener {
 					t.Errorf("Expected %d filter chains on listener, got %d", tt.numFilterChainsOnListener, filterChainCount)
 				}
+				if cidrCount != tt.numCIDRsOnListener {
+					t.Errorf("Expected %d CIDRs on listener, got %d", tt.numCIDRsOnListener, cidrCount)
+				}
 			}
+		})
+	}
+}
+
+func headlessTestService(name string, p protocol.Instance, age time.Duration) *model.Service {
+	s := buildServiceWithPort(name, 8080, p, tnow.Add(age))
+	s.Resolution = model.Passthrough
+	s.Attributes.ServiceRegistry = provider.Kubernetes
+	return s
+}
+
+func headlessTestListeners(t *testing.T, services []*model.Service, instances []*model.ServiceInstance, configs ...config.Config) []*listener.Listener {
+	t.Helper()
+	cg := NewConfigGenTest(t, TestOptions{Services: services, Instances: instances, Configs: configs})
+	p := cg.SetupProxy(getProxy())
+	listeners := NewListenerBuilder(p, cg.env.PushContext()).buildSidecarOutboundListeners(p, cg.env.PushContext())
+	xdstest.ValidateListeners(t, listeners)
+	return listeners
+}
+
+func headlessTestCluster(t *testing.T, chain *listener.FilterChain) string {
+	t.Helper()
+	for _, filter := range chain.Filters {
+		if filter.Name == wellknown.TCPProxy {
+			cfg := &tcp.TcpProxy{}
+			assert.NoError(t, filter.GetTypedConfig().UnmarshalTo(cfg))
+			return cfg.GetCluster()
+		}
+	}
+	t.Fatal("missing TCP proxy")
+	return ""
+}
+
+func TestHeadlessBatchingCIDRConflict(t *testing.T) {
+	test.SetForTest(t, &features.EnableHeadlessFilterChainListener, true)
+	for _, age := range []time.Duration{-time.Second, time.Second} {
+		t.Run(fmt.Sprint(age), func(t *testing.T) {
+			h := headlessTestService("headless.test", protocol.TCP, 0)
+			s := buildService("ordinary.test", "10.0.0.2/32", protocol.TCP, tnow.Add(age))
+			listeners := headlessTestListeners(t, []*model.Service{h, s}, []*model.ServiceInstance{
+				buildServiceInstance(h, "10.0.0.2"), buildServiceInstance(h, "10.0.0.3"),
+			})
+			l := xdstest.ExtractListener("0.0.0.0_8080", listeners)
+			if l == nil {
+				t.Fatal("missing wildcard listener")
+			}
+			seen := map[string]string{}
+			for _, fc := range l.FilterChains {
+				for _, cidr := range fc.GetFilterChainMatch().PrefixRanges {
+					if _, found := seen[cidr.AddressPrefix]; found {
+						t.Fatalf("duplicate destination prefix across chains: %v", cidr)
+					}
+					seen[cidr.AddressPrefix] = headlessTestCluster(t, fc)
+				}
+			}
+			assert.Equal(t, len(seen), 2)
+			winner := "headless.test"
+			if age < 0 {
+				winner = "ordinary.test"
+			}
+			assert.Equal(t, seen["10.0.0.2"], "outbound|8080||"+winner)
+			assert.Equal(t, seen["10.0.0.3"], "outbound|8080||headless.test")
+		})
+	}
+}
+
+func TestHeadlessBatchingDistinctSNI(t *testing.T) {
+	test.SetForTest(t, &features.EnableHeadlessFilterChainListener, true)
+	a := headlessTestService("a.test", protocol.TLS, 0)
+	b := headlessTestService("b.test", protocol.TLS, time.Second)
+	vs := func(s *model.Service) config.Config {
+		return config.Config{
+			Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: string(s.Hostname), Namespace: "default"},
+			Spec: &networking.VirtualService{Hosts: []string{string(s.Hostname)}, Tls: []*networking.TLSRoute{{
+				Match: []*networking.TLSMatchAttributes{{SniHosts: []string{string(s.Hostname)}}},
+				Route: []*networking.RouteDestination{{Destination: &networking.Destination{Host: string(s.Hostname), Port: &networking.PortSelector{Number: 8080}}}},
+			}}},
+		}
+	}
+	listeners := headlessTestListeners(t, []*model.Service{a, b}, []*model.ServiceInstance{
+		buildServiceInstance(a, "10.0.0.2"), buildServiceInstance(b, "10.0.0.2"),
+	}, vs(a), vs(b))
+	found := map[string]string{}
+	for _, l := range listeners {
+		for _, fc := range l.FilterChains {
+			for _, sni := range fc.GetFilterChainMatch().ServerNames {
+				found[sni] = headlessTestCluster(t, fc)
+			}
+		}
+	}
+	assert.Equal(t, found, map[string]string{"a.test": "outbound|8080||a.test", "b.test": "outbound|8080||b.test"})
+}
+
+func TestHeadlessBatchingSubnetMatches(t *testing.T) {
+	test.SetForTest(t, &features.EnableHeadlessFilterChainListener, true)
+	for _, shared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shared=%t", shared), func(t *testing.T) {
+			b := headlessTestService("b.test", protocol.TCP, 0)
+			services := []*model.Service{b}
+			instances := []*model.ServiceInstance{buildServiceInstance(b, "10.0.0.2"), buildServiceInstance(b, "10.0.0.3")}
+			subnet := "10.0.0.2"
+			if shared {
+				a := headlessTestService("a.test", protocol.TCP, -time.Second)
+				services = append(services, a)
+				instances = append(instances, buildServiceInstance(a, "10.0.0.2"))
+				subnet = "192.168.1.0/24"
+			}
+			vs := config.Config{
+				Meta: config.Meta{GroupVersionKind: gvk.VirtualService, Name: "b-route", Namespace: "default"},
+				Spec: &networking.VirtualService{Hosts: []string{"b.test"}, Tcp: []*networking.TCPRoute{{
+					Match: []*networking.L4MatchAttributes{{DestinationSubnets: []string{subnet}}},
+					Route: []*networking.RouteDestination{{Destination: &networking.Destination{Host: "b.test", Port: &networking.PortSelector{Number: 8080}}}},
+				}}},
+			}
+			listeners := headlessTestListeners(t, services, instances, vs)
+			found := map[string]string{}
+			for _, l := range listeners {
+				for _, fc := range l.FilterChains {
+					for _, cidr := range fc.GetFilterChainMatch().PrefixRanges {
+						if _, exists := found[cidr.AddressPrefix]; exists {
+							t.Fatalf("duplicate prefix: %v", cidr)
+						}
+						found[cidr.AddressPrefix] = headlessTestCluster(t, fc)
+					}
+				}
+			}
+			if shared {
+				assert.Equal(t, found["192.168.1.0"], "outbound|8080||b.test")
+			} else {
+				assert.Equal(t, found["10.0.0.2"], "outbound|8080||b.test")
+			}
+			assert.Equal(t, found["10.0.0.3"], "outbound|8080||b.test")
+		})
+	}
+}
+
+func TestHeadlessBatchingDuplicateEndpoints(t *testing.T) {
+	test.SetForTest(t, &features.EnableHeadlessFilterChainListener, true)
+	h := headlessTestService("headless.test", protocol.TCP, 0)
+	listeners := headlessTestListeners(t, []*model.Service{h}, []*model.ServiceInstance{
+		buildServiceInstance(h, "10.0.0.2"), buildServiceInstance(h, "10.0.0.2"),
+		buildServiceInstance(h, "fd00::2"), buildServiceInstance(h, "fd00:0:0:0:0:0:0:2"),
+	})
+	l := xdstest.ExtractListener("0.0.0.0_8080", listeners)
+	if l == nil {
+		t.Fatal("missing wildcard listener")
+	}
+	assert.Equal(t, len(l.FilterChains), 1)
+	assert.Equal(t, len(l.FilterChains[0].GetFilterChainMatch().PrefixRanges), 2)
+}
+
+func TestHeadlessTemplateIsolation(t *testing.T) {
+	test.SetForTest(t, &features.EnableHeadlessFilterChainListener, false)
+	for _, p := range []protocol.Instance{protocol.TCP, protocol.TLS} {
+		t.Run(string(p), func(t *testing.T) {
+			h := headlessTestService("headless.test", p, 0)
+			listeners := headlessTestListeners(t, []*model.Service{h}, []*model.ServiceInstance{
+				buildServiceInstance(h, "10.0.0.2"), buildServiceInstance(h, "10.0.0.3"),
+			})
+			assert.Equal(t, len(listeners), 2)
+			f1, f2 := listeners[0].FilterChains[0].Filters[0], listeners[1].FilterChains[0].Filters[0]
+			if f1 == f2 || f1.GetTypedConfig() == f2.GetTypedConfig() {
+				t.Fatal("listeners share mutable filter protobufs")
+			}
+			before := protomarshal.Clone(f2)
+			f1.Name = "mutated"
+			f1.GetTypedConfig().Value[0] ^= 1
+			assert.Equal(t, proto.Equal(f2, before), true)
 		})
 	}
 }

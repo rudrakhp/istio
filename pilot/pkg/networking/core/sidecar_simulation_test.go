@@ -1211,27 +1211,32 @@ func TestHeadlessServiceListenerShape(t *testing.T) {
 			t.Fatalf("expected listener 0.0.0.0_8080, got: %v", xdstest.ExtractListenerNames(sim.Listeners))
 		}
 
-		// No FilterChainMatcher — matching is done via per-chain FilterChainMatch.PrefixRanges.
+		// No FilterChainMatcher — matching is done via FilterChainMatch.PrefixRanges.
 		if l.FilterChainMatcher != nil {
 			t.Error("expected no FilterChainMatcher on CIDR-chain headless listener")
 		}
 
 		// The proxy IP is 1.1.1.1 (FakeDiscoveryServer default), skipped. 3 pod IPs remain.
-		// Each pod gets its own /32 CIDR-matched filter chain.
+		// All pod /32 CIDRs share one filter chain because their filters are identical.
 		cidrChains := 0
+		cidrCount := 0
 		for _, fc := range l.FilterChains {
 			if fc.GetFilterChainMatch() == nil || len(fc.GetFilterChainMatch().GetPrefixRanges()) == 0 {
 				continue
 			}
 			cidrChains++
 			for _, r := range fc.GetFilterChainMatch().GetPrefixRanges() {
+				cidrCount++
 				if r.GetPrefixLen().GetValue() != 32 {
 					t.Errorf("expected /32 prefix range, got /%d", r.GetPrefixLen().GetValue())
 				}
 			}
 		}
-		if cidrChains != 3 {
-			t.Errorf("expected 3 per-pod CIDR filter chains, got %d", cidrChains)
+		if cidrChains != 1 {
+			t.Errorf("expected 1 batched CIDR filter chain, got %d", cidrChains)
+		}
+		if cidrCount != 3 {
+			t.Errorf("expected 3 pod CIDRs, got %d", cidrCount)
 		}
 
 		// The HTTP ClusterIP service on the same port should still be reachable — it matches on

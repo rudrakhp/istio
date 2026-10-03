@@ -57,6 +57,7 @@ import (
 	secconst "istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/slices"
 	netutil "istio.io/istio/pkg/util/net"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/wellknown"
 )
@@ -479,6 +480,10 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 			for _, e := range listenerMap {
 				e.locked = true
 			}
+			var headlessPortsToBatch map[int]bool
+			if features.EnableHeadlessFilterChainListener && bind.Primary() == "" {
+				headlessPortsToBatch = headlessBatchingPorts(node, services)
+			}
 
 			for _, service := range services {
 				saddress := service.GetAddressForProxy(node)
@@ -525,6 +530,9 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 							continue
 						}
 
+						var headlessPodCIDRs []string
+						useHeadlessCIDR := features.EnableHeadlessFilterChainListener && servicePort.Protocol.IsTCP()
+						batchEndpoints := false
 						for _, instance := range instances {
 							// Make sure each endpoint address is a valid IP address
 							// as service entries could have NONE resolution with label selectors for workload
@@ -553,24 +561,50 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 							// nil, so a nil field means "not yet computed".
 							if listenerOpts.precomputedTCPConfigs == nil {
 								listenerOpts.precomputedTCPConfigs = getConfigsForHost("", service.Hostname, virtualServices)
+								batchEndpoints = useHeadlessCIDR && headlessPortsToBatch[servicePort.Port] && !headlessHasSubnetMatches(listenerOpts.precomputedTCPConfigs)
 							}
 
-							if features.EnableHeadlessFilterChainListener && servicePort.Protocol.IsTCP() {
-								// Build a single wildcard listener with per-pod /32 CIDR filter chain matches
-								// instead of a separate per-pod-IP listener. This reduces the total listener
-								// count from O(endpoints) to O(1) per headless service port.
-								// Only applies to pure TCP ports: for auto-detect (Unsupported) ports, Envoy's
-								// filter chain matching gives destination IP higher priority than ALPN, so CIDR
-								// on the TCP chain would steal HTTP traffic away from the HCM chain.
-								perPodOpts := listenerOpts
-								perPodOpts.bind.binds = actualWildcards
-								perPodOpts.cidr = instance.Addresses
-								perPodOpts.headlessPodCIDR = true
-								lb.buildSidecarOutboundListener(perPodOpts, listenerMap, virtualServices, actualWildcards)
-							} else {
+							if batchEndpoints {
+								for _, address := range instance.Addresses {
+									prefix, _ := util.AddrStrToPrefix(address) // Addresses were validated above.
+									headlessPodCIDRs = append(headlessPodCIDRs, prefix.String())
+								}
+								continue
+							}
+
+							if !useHeadlessCIDR {
+								// Build invariant filters once; clone them for independent per-pod listeners.
+								if servicePort.Protocol.IsTCP() && listenerOpts.precomputedTCPFilterChainOpts == nil {
+									templateOpts := listenerOpts
+									templateOpts.bind.binds = instance.Addresses
+									listenerOpts.precomputedTCPFilterChainOpts = buildSidecarOutboundTCPListenerOpts(templateOpts, virtualServices)
+								}
 								listenerOpts.bind.binds = instance.Addresses
 								lb.buildSidecarOutboundListener(listenerOpts, listenerMap, virtualServices, actualWildcards)
+								continue
 							}
+
+							// Preserve per-endpoint conflict handling when other CIDR chains can share
+							// this listener or a VirtualService overrides the endpoint match.
+							// Build a single wildcard listener with per-pod /32 CIDR filter chain matches
+							// instead of a separate per-pod-IP listener. This reduces the total listener
+							// count from O(endpoints) to O(1) per headless service port.
+							// Only applies to pure TCP ports: for auto-detect (Unsupported) ports, Envoy's
+							// filter chain matching gives destination IP higher priority than ALPN, so CIDR
+							// on the TCP chain would steal HTTP traffic away from the HCM chain.
+							perPodOpts := listenerOpts
+							perPodOpts.bind.binds = actualWildcards
+							perPodOpts.cidr = instance.Addresses
+							perPodOpts.headlessPodCIDR = true
+							lb.buildSidecarOutboundListener(perPodOpts, listenerMap, virtualServices, actualWildcards)
+						}
+						if len(headlessPodCIDRs) > 0 {
+							// Repeated endpoints must not create duplicate prefix matches within one chain.
+							headlessPodCIDRs = sets.SortedList(sets.New(headlessPodCIDRs...))
+							listenerOpts.bind.binds = actualWildcards
+							listenerOpts.cidr = headlessPodCIDRs
+							listenerOpts.headlessPodCIDR = true
+							lb.buildSidecarOutboundListener(listenerOpts, listenerMap, virtualServices, actualWildcards)
 						}
 					} else {
 						// Standard logic for headless and non headless services
@@ -585,6 +619,52 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 	// TODO: This is going to be bad for caching as the order of listeners in tcpListeners or httpListeners is not
 	// guaranteed.
 	return finalizeOutboundListeners(lb, listenerMap)
+}
+
+// headlessBatchingPorts identifies wildcard TCP ports with only one service contributing
+// CIDR chains. Batching on shared ports would change the match sets used by conflict handling.
+func headlessBatchingPorts(node *model.Proxy, services []*model.Service) map[int]bool {
+	counts := make(map[int]int)
+	for _, service := range services {
+		address := service.GetAddressForProxy(node)
+		if service.Resolution == model.Alias ||
+			!(strings.Contains(address, "/") || address == constants.UnspecifiedIP || address == constants.UnspecifiedIPv6) {
+			continue
+		}
+		for _, port := range service.Ports {
+			if port.Protocol.IsTCP() || port.Protocol.IsUnsupported() {
+				counts[port.Port]++
+			}
+		}
+	}
+	ports := make(map[int]bool, len(counts))
+	for port, count := range counts {
+		ports[port] = count == 1
+	}
+	return ports
+}
+
+// Explicit subnet matches can overlap the endpoint-derived default chain. Retain the
+// original per-endpoint construction so each conflict is resolved before any batching.
+func headlessHasSubnetMatches(configs []*config.Config) bool {
+	for _, cfg := range configs {
+		vs := cfg.Spec.(*networking.VirtualService)
+		for _, route := range vs.Tcp {
+			for _, match := range route.Match {
+				if len(match.GetDestinationSubnets()) > 0 {
+					return true
+				}
+			}
+		}
+		for _, route := range vs.Tls {
+			for _, match := range route.Match {
+				if len(match.GetDestinationSubnets()) > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func finalizeOutboundListeners(lb *ListenerBuilder, listenerMap map[listenerKey]*outboundListenerEntry) []*listener.Listener {
@@ -819,6 +899,10 @@ func buildSidecarOutboundHTTPListenerOpts(
 }
 
 func buildSidecarOutboundTCPListenerOpts(opts outboundListenerOpts, virtualServices []*config.Config) []*filterChainOpts {
+	if opts.precomputedTCPFilterChainOpts != nil {
+		return cloneTCPFilterChainOpts(opts.precomputedTCPFilterChainOpts)
+	}
+
 	meshGateway := sets.New(constants.IstioMeshGateway)
 	out := make([]*filterChainOpts, 0)
 	var svcConfigs []*config.Config
@@ -839,6 +923,31 @@ func buildSidecarOutboundTCPListenerOpts(opts outboundListenerOpts, virtualServi
 		opts.bind.Primary(), opts.port, meshGateway, svcConfigs, opts.headlessPodCIDR)...)
 	out = append(out, buildSidecarOutboundTCPFilterChainOpts(opts.proxy, opts.push, opts.cidr, opts.service,
 		opts.port, meshGateway, svcConfigs)...)
+	return out
+}
+
+// cloneTCPFilterChainOpts gives each listener independent protobufs so later EnvoyFilter
+// patches cannot mutate filters shared by another listener. TCP filter-chain options do not
+// contain httpOpts, but may contain metadata or a TLS context depending on the port protocol.
+func cloneTCPFilterChainOpts(in []*filterChainOpts) []*filterChainOpts {
+	out := make([]*filterChainOpts, 0, len(in))
+	for _, opt := range in {
+		cloned := *opt
+		cloned.sniHosts = slices.Clone(opt.sniHosts)
+		cloned.destinationCIDRs = slices.Clone(opt.destinationCIDRs)
+		cloned.applicationProtocols = slices.Clone(opt.applicationProtocols)
+		if opt.metadata != nil {
+			cloned.metadata = protomarshal.Clone(opt.metadata)
+		}
+		if opt.tlsContext != nil {
+			cloned.tlsContext = protomarshal.Clone(opt.tlsContext)
+		}
+		cloned.networkFilters = make([]*listener.Filter, 0, len(opt.networkFilters))
+		for _, filter := range opt.networkFilters {
+			cloned.networkFilters = append(cloned.networkFilters, protomarshal.Clone(filter))
+		}
+		out = append(out, &cloned)
+	}
 	return out
 }
 
@@ -1174,6 +1283,11 @@ type outboundListenerOpts struct {
 	// buildSidecarOutboundListeners) skip repeating the O(len(virtualServices)) host-matching
 	// scan for every pod, since the result is identical for every pod of that service+port.
 	precomputedTCPConfigs []*config.Config
+
+	// precomputedTCPFilterChainOpts is an immutable template for the TCP filter chains used by
+	// legacy per-pod-IP headless listeners. Each use is deep-cloned before listener construction
+	// because EnvoyFilter patches may mutate the resulting protobufs.
+	precomputedTCPFilterChainOpts []*filterChainOpts
 }
 
 // buildGatewayListener builds and initializes a Listener proto based on the provided opts. It does not set any filters.
