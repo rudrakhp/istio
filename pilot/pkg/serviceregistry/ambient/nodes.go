@@ -90,7 +90,7 @@ func GlobalNodesCollection(
 				krt.WithName(fmt.Sprintf("ambient/NodeLocalityWithCluster[%s]", c.ID())),
 				krt.WithDebugging(opts.Debugger()),
 				krt.WithStop(c.GetStop()),
-				krt.WithMetadata(krt.Metadata{multicluster.ClusterKRTMetadataKey: c.ID()}),
+				krt.WithMetadata(c.Metadata()),
 			}
 			nodes := krt.NewCollection(c.Nodes(), func(ctx krt.HandlerContext, k *v1.Node) *krt.ObjectWithCluster[Node] {
 				return &krt.ObjectWithCluster[Node]{

@@ -43,6 +43,21 @@ func NestedCollectionIndexByCluster[T any](
 	})
 }
 
+// FetchCollectionForCluster returns a sibling from this generation, or nil until it is published.
+// The sibling must carry c.Metadata().
+func FetchCollectionForCluster[T any](
+	ctx krt.HandlerContext,
+	collections krt.Collection[krt.Collection[T]],
+	index krt.Index[cluster.ID, krt.Collection[T]],
+	c ClusterCollections,
+) *krt.Collection[T] {
+	col := krt.FetchOne(ctx, collections, krt.FilterIndex(index, c.ID()))
+	if col == nil || (*col).Metadata()[clusterGenerationMetadataKey] != c.cluster.kubeConfigSha {
+		return nil
+	}
+	return col
+}
+
 // NestedCollectionFromLocalAndRemote builds a collection of collections that merges
 // a local collection with per-cluster remote collections derived from the Controller's clusters
 // collection.
@@ -83,8 +98,8 @@ func NestedCollectionFromLocalAndRemote[T any](
 //     Using a process-wide stop channel instead leaks the registration, the informers and the cluster
 //     itself;
 //   - return nil if it cannot build the collections yet (for example a krt.Fetch on another
-//     per-cluster collection that has not been computed yet). The cluster is then omitted until the
-//     transformation is recomputed;
+//     per-cluster collection that has not been computed yet). The previous contribution is retained
+//     until the transformation is recomputed; a new cluster is omitted until then;
 //   - not retain the ClusterCollections, or the collections it returns, past the call.
 //
 // The returned collections are cached per (cluster ID, kubeconfig SHA) so that unrelated recomputes
@@ -129,7 +144,8 @@ func NestedManyCollectionsFromLocalAndRemote[T any](
 		cols := clusterToCollections(ctx, ClusterCollections{cluster: c})
 		if cols == nil {
 			log.Warnf("no collections for %s returned for cluster %v", name, c.ID)
-			return nil
+			// Keep the previous view without caching it under the replacement's generation.
+			return cache.GetLast(c.ID)
 		}
 		cache.Insert(c.ID, c.kubeConfigSha, cols)
 		return cols
@@ -168,6 +184,12 @@ func (c *collectionCacheByClusterMany[T]) Get(clusterID cluster.ID, kubeConfigSh
 		return nil
 	}
 	return existing.collections
+}
+
+func (c *collectionCacheByClusterMany[T]) GetLast(clusterID cluster.ID) []krt.Collection[T] {
+	c.RLock()
+	defer c.RUnlock()
+	return c.collections[clusterID].collections
 }
 
 func (c *collectionCacheByClusterMany[T]) Insert(clusterID cluster.ID, kubeConfigSha [sha256.Size]byte, cols []krt.Collection[T]) {

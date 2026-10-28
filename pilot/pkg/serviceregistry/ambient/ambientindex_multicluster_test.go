@@ -18,11 +18,13 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
 	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"istio.io/api/label"
@@ -32,6 +34,8 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
@@ -59,6 +63,8 @@ type ambientclients struct {
 
 type remoteAmbientClients struct {
 	clusterID cluster.ID
+	stop      <-chan struct{}
+	nodes     clienttest.TestWriter[*corev1.Node]
 	*ambientclients
 }
 
@@ -125,6 +131,8 @@ func (s *ambientTestServer) newClusterClients(t *testing.T, stop <-chan struct{}
 				// has to be named to take its address.
 				col := krt.NewStaticCollection(nil, []*remoteAmbientClients{{
 					clusterID: c.ID(),
+					stop:      c.GetStop(),
+					nodes:     clienttest.NewWriter[*corev1.Node](t, cl),
 					ambientclients: &ambientclients{
 						pc:    clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
 						sc:    clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
@@ -964,6 +972,132 @@ func (s *ambientTestServer) DeleteSecret(secretName string) {
 func (s *ambientTestServer) AddSecret(secretName, clusterID string) {
 	kubeconfig++
 	s.sec.CreateOrUpdate(makeSecret(secretNamespace, secretName, clusterCredential{clusterID, fmt.Appendf(nil, "kubeconfig-%d", kubeconfig)}))
+}
+
+func TestMulticlusterAmbientIndex_CredentialRotation(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	for _, resource := range []string{"gateways", "workloads", "waypoints-and-nodes"} {
+		for _, rotate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rotate=%v", resource, rotate), func(t *testing.T) {
+				s := newAmbientTestServer(t, testC, testNW, "")
+				remoteNetwork := "remote-network"
+				if resource == "waypoints-and-nodes" {
+					remoteNetwork = testNW
+				}
+				buildClient := testingBuildClientsFromConfig(t)
+				s.mcController.ClientBuilder = func(config []byte, id cluster.ID, overrides ...func(*rest.Config)) (kube.Client, error) {
+					client, err := buildClient(config, id, overrides...)
+					if err != nil {
+						return nil, err
+					}
+					// Every client generation starts with the same API state, as a real cluster would.
+					namespaces := clienttest.NewWriter[*corev1.Namespace](t, client)
+					for _, name := range []string{systemNS, testNS} {
+						namespaces.Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+							Name: name, Labels: map[string]string{label.TopologyNetwork.Name: remoteNetwork},
+						}})
+					}
+					s.addNetworkGatewayForClient(t, "77.1.2.49", remoteNetwork, clienttest.NewWriter[*k8sv1.Gateway](t, client))
+					clienttest.NewWriter[*corev1.Service](t, client).Create(generateService("existing", testNS,
+						map[string]string{"istio.io/global": "true"}, nil, []int32{80}, map[string]string{"app": "existing"}, "10.0.0.2"))
+					pod := generatePod("127.0.0.2", "existing", testNS, "sa1", "node1", map[string]string{"app": "existing"}, nil)
+					pod.Status.Phase = corev1.PodRunning
+					clienttest.NewWriter[*corev1.Pod](t, client).Create(pod)
+					return client, nil
+				}
+				cc := s.newClusterClients(t, test.NewStop(t))
+				s.AddSecret("remote", "remote-cluster")
+				remote := cc.waitForRemotes(t, 1)[0]
+				expectGateway := func(address string) {
+					t.Helper()
+					assert.EventuallyEqual(t, func() bool {
+						gateways := s.networks.NetworkGateways.List()
+						return len(gateways) == 1 && gateways[0].Addr == address
+					}, true)
+				}
+				expectGateway("77.1.2.49")
+				existingService := s.svcXdsName("existing")
+				assert.EventuallyEqual(t, func() bool { return s.lookupService(existingService) != nil }, true)
+				existingWorkload := fmt.Sprintf("remote-network/SplitHorizonWorkload/ns1/east-west/77.1.2.49/%s", existingService)
+				if resource == "waypoints-and-nodes" {
+					existingWorkload = s.podXdsNameForCluster("existing", "remote-cluster")
+				}
+				assert.EventuallyEqual(t, func() bool { return ptr.Flatten(s.workloads.GetKey(existingWorkload)) != nil }, true)
+				var deletions atomic.Int32
+				serviceEvents := s.services.Register(func(e krt.Event[*model.ServiceInfo]) {
+					if e.Event == controllers.EventDelete && krt.GetKey(e.Latest()) == existingService {
+						deletions.Add(1)
+					}
+				})
+				t.Cleanup(serviceEvents.UnregisterHandler)
+				workloadEvents := s.workloads.Register(func(e krt.Event[*model.WorkloadInfo]) {
+					// The gateway case deliberately withdraws the network gateway.
+					if resource != "gateways" && e.Event == controllers.EventDelete && krt.GetKey(e.Latest()) == existingWorkload {
+						deletions.Add(1)
+					}
+				})
+				t.Cleanup(workloadEvents.UnregisterHandler)
+				for generation := range 3 {
+					if rotate {
+						old := remote
+						s.AddSecret("remote", "remote-cluster")
+						assert.EventuallyEqual(t, func() bool {
+							remotes := cc.remotes()
+							return len(remotes) == 1 && remotes[0] != old
+						}, true)
+						remote = cc.remotes()[0]
+						select {
+						case <-old.stop:
+						case <-time.After(5 * time.Second):
+							t.Fatal("previous remote generation was not retired")
+						}
+						t.Logf("rotation %d: replacement published and previous client stopped", generation)
+					}
+					if resource == "gateways" {
+						address := fmt.Sprintf("77.1.2.%d", 50+generation)
+						s.addNetworkGatewayForClient(t, address, remoteNetwork, remote.grc)
+						expectGateway(address)
+						s.deleteNetworkGatewayForClient(t, "east-west", remote.grc)
+						assert.EventuallyEqual(t, func() int { return len(s.networks.NetworkGateways.List()) }, 0)
+					} else {
+						name := fmt.Sprintf("svc-%d", generation)
+						serviceLabels := map[string]string{"istio.io/global": "true"}
+						podLabels := map[string]string{"app": name}
+						zone := fmt.Sprintf("zone-%d", generation)
+						if resource == "waypoints-and-nodes" {
+							remote.nodes.CreateOrUpdate(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+								Name: "node1", Labels: map[string]string{corev1.LabelTopologyZone: zone},
+							}})
+							s.addWaypointSpecificAddressForClient(t, "10.0.0.10", "", "wp", constants.AllTraffic, true, remote.grc)
+							serviceLabels[label.IoIstioUseWaypoint.Name] = "wp"
+							podLabels[label.IoIstioUseWaypoint.Name] = "wp"
+						}
+						s.addServiceForClient(t, name, serviceLabels, nil,
+							[]int32{80}, map[string]string{"app": name}, "10.0.0.1", remote.sc)
+						assert.EventuallyEqual(t, func() bool { return s.lookupService(s.svcXdsName(name)) != nil }, true)
+						s.addPodsForClient(t, "127.0.0.1", name, "sa1", podLabels, nil,
+							true, corev1.PodRunning, remote.pc)
+						key := fmt.Sprintf("remote-network/SplitHorizonWorkload/ns1/east-west/77.1.2.49/%s", s.svcXdsName(name))
+						if resource == "waypoints-and-nodes" {
+							key = s.podXdsNameForCluster(name, "remote-cluster")
+							assert.EventuallyEqual(t, func() []byte {
+								return s.lookupService(s.svcXdsName(name)).Service.Waypoint.GetAddress().GetAddress()
+							}, []byte{10, 0, 0, 10})
+						}
+						assert.EventuallyEqual(t, func() bool {
+							wl := ptr.Flatten(s.workloads.GetKey(key))
+							if wl == nil || wl.Workload.Services[s.svcXdsName(name)] == nil {
+								return false
+							}
+							return resource != "waypoints-and-nodes" ||
+								(wl.Workload.Locality.GetZone() == zone && reflect.DeepEqual(wl.Workload.Waypoint.GetAddress().GetAddress(), []byte{10, 0, 0, 10}))
+						}, true)
+					}
+				}
+				assert.Equal(t, deletions.Load(), int32(0), "rotation must not withdraw existing remote resources")
+			})
+		}
+	}
 }
 
 // TestMulticlusterAmbientIndex_ClusterLifecycleNoLeak verifies that adding and then removing a

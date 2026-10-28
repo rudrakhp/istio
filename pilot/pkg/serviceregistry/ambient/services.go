@@ -184,7 +184,7 @@ func GlobalNestedWorkloadServicesCollection(
 				krt.WithStop(cluster.GetStop()),
 			}
 			services := cluster.Services()
-			waypointsPtr := krt.FetchOne(ctx, globalWaypoints, krt.FilterIndex(waypointsByCluster, cluster.ID()))
+			waypointsPtr := multicluster.FetchCollectionForCluster(ctx, globalWaypoints, waypointsByCluster, cluster)
 			if waypointsPtr == nil {
 				log.Warnf("Cluster %s does not have waypoints assigned, skipping", cluster.ID())
 				return nil
@@ -206,9 +206,7 @@ func GlobalNestedWorkloadServicesCollection(
 				append(
 					opts,
 					krt.WithName(fmt.Sprintf("ambient/ServiceServiceInfos[%s]", cluster.ID())),
-					krt.WithMetadata(krt.Metadata{
-						multicluster.ClusterKRTMetadataKey: cluster.ID(),
-					}),
+					krt.WithMetadata(cluster.Metadata()),
 				)...)
 
 			servicesInfoWithCluster := krt.MapCollection(

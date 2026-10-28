@@ -284,7 +284,7 @@ func MergedGlobalWorkloadsCollection(
 			}
 			endpointSlices := c.EndpointSlices()
 			pods := c.Pods()
-			waypointsPtr := krt.FetchOne(ctx, globalWaypoints, krt.FilterIndex(waypointsByCluster, c.ID()))
+			waypointsPtr := multicluster.FetchCollectionForCluster(ctx, globalWaypoints, waypointsByCluster, c)
 			// This usually happens because the event for a new cluster
 			// triggers the global services|waypoints|etc. transformations in parallel
 			// with this transformation. This Fetch is racing
@@ -299,14 +299,14 @@ func MergedGlobalWorkloadsCollection(
 			waypoints := *waypointsPtr
 
 			namespaces := c.Namespaces()
-			clusteredNodesPtr := krt.FetchOne(ctx, globalNodes, krt.FilterIndex(nodesByCluster, c.ID()))
+			clusteredNodesPtr := multicluster.FetchCollectionForCluster(ctx, globalNodes, nodesByCluster, c)
 			if clusteredNodesPtr == nil {
 				log.Warnf("Cluster %s does not have nodes, skipping global workloads", c.ID())
 				return nil
 			}
 			clusteredNodes := *clusteredNodesPtr
 
-			workloadServicesPtr := krt.FetchOne(ctx, globalWorkloadServices, krt.FilterIndex(globalWorkloadServicesByCluster, c.ID()))
+			workloadServicesPtr := multicluster.FetchCollectionForCluster(ctx, globalWorkloadServices, globalWorkloadServicesByCluster, c)
 			if workloadServicesPtr == nil {
 				log.Warnf("Cluster %s does not have workload services, skipping global workloads", c.ID())
 				return nil

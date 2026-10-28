@@ -258,6 +258,28 @@ func TestNestedCollectionFromLocalAndRemoteRotation(t *testing.T) {
 	})
 }
 
+func TestNestedCollectionRotationWaitsForDependencies(t *testing.T) {
+	runRotationScenario(t, rotationScenario{
+		buildNested: func(ctrl *Controller, local krt.Collection[*v1.Service], opts krt.OptionsBuilder) krt.Collection[krt.Collection[*v1.Service]] {
+			trigger := krt.NewRecomputeTrigger(true, opts.WithName("DependenciesReady")...)
+			seen := sets.New[[sha256.Size]byte]()
+			return NestedCollectionFromLocalAndRemote(ctrl, local,
+				func(ctx krt.HandlerContext, c ClusterCollections) *krt.Collection[*v1.Service] {
+					trigger.MarkDependant(ctx)
+					// Simulate a sibling publishing this generation after the first attempt.
+					if !seen.InsertContains(c.cluster.kubeConfigSha) {
+						trigger.TriggerRecomputation()
+						return nil
+					}
+					return ptr.Of(c.Services())
+				}, "Services", opts)
+		},
+		collectionsPerCluster: 1,
+		initialItems:          []string{"add/ns/svc"},
+		postRotationItems:     []string{"add/ns/later"},
+	})
+}
+
 // TestNestedManyCollectionsFromLocalAndRemoteRotation checks the same for a cluster that contributes
 // more than one collection, including one built by the transformation itself rather than taken from
 // the cluster.

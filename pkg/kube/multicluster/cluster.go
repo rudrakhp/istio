@@ -41,6 +41,8 @@ var _ krt.ResourceNamer = &Cluster{}
 
 const ClusterKRTMetadataKey = "cluster"
 
+const clusterGenerationMetadataKey = "clusterGeneration"
+
 // ClusterCollections is a restricted, read-only view over one generation of a Cluster: its ID, its
 // client, its stop channel and the krt collections built from its informers. It exists so that code
 // outside this package can derive krt collections from a cluster's informers without ever holding
@@ -75,6 +77,14 @@ type ClusterCollections struct {
 // ID returns the ID of the cluster.
 func (cc ClusterCollections) ID() cluster.ID {
 	return cc.cluster.ID
+}
+
+// Metadata identifies this cluster generation on derived collections.
+func (cc ClusterCollections) Metadata() krt.Metadata {
+	return krt.Metadata{
+		ClusterKRTMetadataKey:        cc.ID(),
+		clusterGenerationMetadataKey: cc.cluster.kubeConfigSha,
+	}
 }
 
 // Client returns the cluster's kube client.

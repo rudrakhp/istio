@@ -419,7 +419,7 @@ func GlobalWaypointsCollection(
 				krt.WithName(fmt.Sprintf("Waypoints[%s]", c.ID())),
 				krt.WithDebugging(opts.Debugger()),
 				krt.WithStop(c.GetStop()),
-				krt.WithMetadata(krt.Metadata{multicluster.ClusterKRTMetadataKey: c.ID()}),
+				krt.WithMetadata(c.Metadata()),
 			}
 			pods := c.Pods()
 			podsByNamespace := krt.NewNamespaceIndex(pods)

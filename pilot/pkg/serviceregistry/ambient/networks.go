@@ -129,7 +129,7 @@ func buildGlobalNetworkCollections(
 					multicluster.ClusterKRTMetadataKey: c.ID(),
 				}),
 			}
-			gatewaysPtr := krt.FetchOne(ctx, gateways, krt.FilterIndex(gatewaysByCluster, c.ID()))
+			gatewaysPtr := multicluster.FetchCollectionForCluster(ctx, gateways, gatewaysByCluster, c)
 			if gatewaysPtr == nil {
 				log.Warnf("No gateways found for cluster %s", c.ID())
 				return nil

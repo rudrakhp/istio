@@ -91,6 +91,7 @@ func (a *index) buildGlobalCollections(
 				krt.WithName(fmt.Sprintf("ambient/GatewaysWithCluster[%s]", c.ID())),
 				krt.WithDebugging(opts.Debugger()),
 				krt.WithStop(c.GetStop()),
+				krt.WithMetadata(c.Metadata()),
 			}
 			return ptr.Of(krt.MapCollection(c.Gateways(), func(obj *gatewayv1.Gateway) krt.ObjectWithCluster[*gatewayv1.Gateway] {
 				return krt.ObjectWithCluster[*gatewayv1.Gateway]{
